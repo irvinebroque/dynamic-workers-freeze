@@ -96,12 +96,23 @@ describe("Dynamic worker sandbox", () => {
 		);
 		expect(capturedWorkerCode?.modules["__sandbox__/bootstrap.js"]).toContain("lockdown();");
 		expect(capturedWorkerCode?.modules["__sandbox__/bootstrap.js"]).toContain(
-			"Object.freeze(globalThis);",
+			"return { source: new ModuleSource(module, specifier) };",
 		);
 		expect(capturedWorkerCode?.modules["__sandbox__/bootstrap.js"]).toContain(
-			'guestModulePromise = import("../src/index.js")',
+			"new Compartment({",
+		);
+		expect(capturedWorkerCode?.modules["__sandbox__/bootstrap.js"]).toContain(
+			"Object.freeze(compartment.globalThis);",
+		);
+		expect(capturedWorkerCode?.modules["__sandbox__/bootstrap.js"]).toContain(
+			'headers.set("x-sandbox-isolate-id", getIsolateId());',
 		);
 		expect(capturedWorkerCode?.modules["node_modules/ses/index.js"]).toBeTypeOf("string");
+		expect(
+			Object.keys(capturedWorkerCode?.modules ?? {}).some((modulePath) =>
+				modulePath.includes("@endo/module-source"),
+			),
+		).toBe(true);
 	});
 
 	it("serves usage instructions from the deployed worker (integration style)", async () => {
@@ -112,5 +123,72 @@ describe("Dynamic worker sandbox", () => {
 		expect(response.headers.get("content-type")).toContain("text/html");
 		expect(html).toContain("Dynamic Worker Sandbox");
 		expect(html).toContain("/run");
+	});
+
+	it("runs multiple requests against one loaded dynamic worker", async () => {
+		let requestCount = 0;
+		const isolateId = "test-isolate";
+		const loader = {
+			load() {
+				return {
+					getEntrypoint() {
+						return {
+							fetch: vi.fn(async () => {
+								requestCount += 1;
+								return Response.json(
+									{ moduleCounter: 1 },
+									{
+										headers: {
+											"x-sandbox-isolate-id": isolateId,
+											"x-sandbox-execution-id": String(requestCount),
+										},
+									},
+								);
+							}),
+						};
+					},
+				};
+			},
+		} as unknown as WorkerLoader;
+
+		const formData = new FormData();
+		formData.set(
+			"code",
+			[
+				"let moduleCounter = 0;",
+				"",
+				"export default {",
+				"  async fetch() {",
+				"    moduleCounter += 1;",
+				"    return Response.json({ moduleCounter });",
+				"  },",
+				"};",
+			].join("\n"),
+		);
+
+		const request = new IncomingRequest("https://example.com/run", {
+			method: "POST",
+			body: formData,
+		});
+		const ctx = createExecutionContext();
+		const response = await worker.fetch(request, { ...env, LOADER: loader } as Env, ctx);
+		await waitOnExecutionContext(ctx);
+		const html = await response.text();
+
+		expect(response.status).toBe(200);
+		expect(html).toContain("Made 3 requests against one loaded dynamic worker isolate.");
+		expect(html).toContain("Request 1");
+		expect(html).toContain("Request 2");
+		expect(html).toContain("Request 3");
+		expect(html.match(/"moduleCounter": 1/g)).toHaveLength(3);
+
+		const isolateIds = [...html.matchAll(/x-sandbox-isolate-id: ([\w-]+)/g)].map(
+			(match) => match[1],
+		);
+		expect(isolateIds).toHaveLength(3);
+		expect(new Set(isolateIds).size).toBe(1);
+		expect(html).toContain("x-sandbox-execution-id: 1");
+		expect(html).toContain("x-sandbox-execution-id: 2");
+		expect(html).toContain("x-sandbox-execution-id: 3");
 	});
 });

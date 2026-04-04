@@ -1,8 +1,10 @@
 import { createWorker } from "@cloudflare/worker-bundler";
 
 const BOOTSTRAP_PATH = "__sandbox__/bootstrap.ts";
-const BOOTSTRAP_OUTPUT_PATH = "__sandbox__/bootstrap.js";
 const COMPATIBILITY_DATE = "2026-04-03";
+const GUEST_MODULE_SPECIFIER = "guest";
+const MODULE_SOURCE_VERSION = "^1.4.0";
+const SES_VERSION = "^1.15.0";
 const SANDBOX_URL = "https://sandbox.example";
 
 type SandboxFiles = Record<string, string>;
@@ -20,54 +22,100 @@ export interface ExecutePayload {
 	request?: SandboxRequestInit;
 }
 
-export async function executeSandbox(payload: ExecutePayload, env: Env): Promise<Response> {
-	const files = payload.files;
-	if (!isStringRecord(files) || Object.keys(files).length === 0) {
-		return Response.json(
-			{ error: "Payload must include a non-empty files object." },
-			{ status: 400 },
-		);
+export interface SandboxSession {
+	fetch(request?: SandboxRequestInit): Promise<Response>;
+}
+
+export async function createInlineSandboxSession(code: string, env: Env): Promise<SandboxSession> {
+	const guestWorker = await createWorker({
+		files: {
+			"src/index.ts": code,
+		},
+		entryPoint: "src/index.ts",
+		bundle: false,
+	});
+	const guestSource = guestWorker.modules[guestWorker.mainModule];
+	if (typeof guestSource !== "string") {
+		throw new TypeError("Guest entrypoint must compile to a JavaScript module.");
 	}
 
-	let sandboxFiles: SandboxFiles;
+	const bootstrapWorker = await createWorker({
+		files: buildInlineBootstrapFiles(buildInlineGuestModuleSource(guestSource)),
+		entryPoint: BOOTSTRAP_PATH,
+		bundle: false,
+	});
+
+	const worker = env.LOADER.load({
+		compatibilityDate: COMPATIBILITY_DATE,
+		globalOutbound: null,
+		mainModule: bootstrapWorker.mainModule,
+		modules: bootstrapWorker.modules,
+	});
+	const entrypoint = worker.getEntrypoint();
+
+	return {
+		fetch(request) {
+			return entrypoint.fetch(buildSandboxRequest(request));
+		},
+	};
+}
+
+export async function executeSandbox(payload: ExecutePayload, env: Env): Promise<Response> {
+	try {
+		const session = await createSandboxSession(payload, env);
+		return await session.fetch(payload.request);
+	} catch (error) {
+		if (error instanceof SandboxPayloadError) {
+			return Response.json({ error: error.message }, { status: 400 });
+		}
+
+		console.error("Sandbox execution failed", error);
+		return Response.json({ error: getErrorMessage(error) }, { status: 500 });
+	}
+}
+
+export async function createSandboxSession(
+	payload: ExecutePayload,
+	env: Env,
+): Promise<SandboxSession> {
+	const files = payload.files;
+	if (!isStringRecord(files) || Object.keys(files).length === 0) {
+		throw new SandboxPayloadError("Payload must include a non-empty files object.");
+	}
+
 	let entryPoint: string;
 
 	try {
 		entryPoint = resolveEntryPoint(files, payload.entryPoint);
-		sandboxFiles = buildSandboxFiles(files, entryPoint);
 	} catch (error) {
-		return Response.json({ error: getErrorMessage(error) }, { status: 400 });
+		throw new SandboxPayloadError(getErrorMessage(error));
 	}
 
-	try {
-		const bootstrapWorker = await createWorker({
-			files: sandboxFiles,
-			entryPoint: BOOTSTRAP_PATH,
-			bundle: false,
-		});
+	const guestWorker = await createWorker({
+		files,
+		entryPoint,
+		bundle: false,
+	});
 
-		const guestWorker = await createWorker({
-			files: sandboxFiles,
-			entryPoint,
-			bundle: false,
-		});
+	const bootstrapWorker = await createWorker({
+		files: buildBootstrapFiles(guestWorker.mainModule, guestWorker.modules),
+		entryPoint: BOOTSTRAP_PATH,
+		bundle: false,
+	});
 
-		const worker = env.LOADER.load({
-			compatibilityDate: COMPATIBILITY_DATE,
-			globalOutbound: null,
-			mainModule: bootstrapWorker.mainModule,
-			modules: {
-				...guestWorker.modules,
-				...bootstrapWorker.modules,
-			},
-		});
+	const worker = env.LOADER.load({
+		compatibilityDate: COMPATIBILITY_DATE,
+		globalOutbound: null,
+		mainModule: bootstrapWorker.mainModule,
+		modules: bootstrapWorker.modules,
+	});
+	const entrypoint = worker.getEntrypoint();
 
-		const sandboxRequest = buildSandboxRequest(payload.request);
-		return await worker.getEntrypoint().fetch(sandboxRequest);
-	} catch (error) {
-		console.error("Sandbox execution failed", error);
-		return Response.json({ error: getErrorMessage(error) }, { status: 500 });
-	}
+	return {
+		fetch(request) {
+			return entrypoint.fetch(buildSandboxRequest(request));
+		},
+	};
 }
 
 export async function readExecutePayload(request: Request): Promise<ExecutePayload> {
@@ -78,26 +126,132 @@ export async function readExecutePayload(request: Request): Promise<ExecutePaylo
 	}
 }
 
-function buildSandboxFiles(files: SandboxFiles, entryPoint: string): SandboxFiles {
-	const guestEntrypoint = toOutputPath(entryPoint);
-	const guestSpecifier = relativeModuleSpecifier(BOOTSTRAP_OUTPUT_PATH, guestEntrypoint);
-
+function buildBootstrapFiles(
+	guestMainModule: string,
+	guestModules: WorkerLoaderWorkerCode["modules"],
+): SandboxFiles {
 	return {
-		...files,
-		"package.json": mergePackageJson(files["package.json"]),
+		"package.json": JSON.stringify(
+			{
+				private: true,
+				dependencies: {
+					"@endo/module-source": MODULE_SOURCE_VERSION,
+					ses: SES_VERSION,
+				},
+			},
+			null,
+			2,
+		),
 		[BOOTSTRAP_PATH]: [
 			'import "ses";',
+			'import { ModuleSource } from "@endo/module-source";',
 			"",
-			"let guestModulePromise: Promise<any> | undefined;",
+			"lockdown();",
+			"Object.freeze(globalThis);",
 			"",
-			"function getGuestModule() {",
-			"  if (!guestModulePromise) {",
-			"    lockdown();",
-			"    Object.freeze(globalThis);",
-			`    guestModulePromise = import(${JSON.stringify(guestSpecifier)});`,
+			`const GUEST_MAIN_MODULE = ${JSON.stringify(guestMainModule)};`,
+			`const GUEST_MODULES = ${JSON.stringify(guestModules)};`,
+			"let isolateId: string | undefined;",
+			"let executionCount = 0;",
+			"",
+			"function getIsolateId(): string {",
+			"  isolateId ??= crypto.randomUUID();",
+			"  return isolateId;",
+			"}",
+			"",
+			"function createConsole() {",
+			"  return harden({",
+			"    log: (...args: unknown[]) => console.log(...args),",
+			"    info: (...args: unknown[]) => console.info(...args),",
+			"    warn: (...args: unknown[]) => console.warn(...args),",
+			"    error: (...args: unknown[]) => console.error(...args),",
+			"    debug: (...args: unknown[]) => console.debug(...args),",
+			"  });",
+			"}",
+			"",
+			"function resolveGuestSpecifier(specifier: string, referrer: string = GUEST_MAIN_MODULE): string {",
+			"  if (specifier.startsWith(\"/\")) {",
+			"    return specifier.slice(1);",
 			"  }",
 			"",
-			"  return guestModulePromise;",
+			"  if (!specifier.startsWith(\".\")) {",
+			"    return specifier;",
+			"  }",
+			"",
+			"  const referrerParts = referrer.split(\"/\");",
+			"  referrerParts.pop();",
+			"",
+			"  for (const segment of specifier.split(\"/\")) {",
+			"    if (segment === \".\" || segment === \"\") {",
+			"      continue;",
+			"    }",
+			"",
+			"    if (segment === \"..\") {",
+			"      referrerParts.pop();",
+			"      continue;",
+			"    }",
+			"",
+			"    referrerParts.push(segment);",
+			"  }",
+			"",
+			"  return referrerParts.join(\"/\");",
+			"}",
+			"",
+			"function createValueModule(value: unknown) {",
+			"  return {",
+			"    imports: [],",
+			"    exports: [\"default\"],",
+			"    execute(exports: Record<string, unknown>) {",
+			"      exports.default = value;",
+			"    },",
+			"  };",
+			"}",
+			"",
+			"function loadGuestModule(specifier: string) {",
+			"  const module = GUEST_MODULES[specifier];",
+			"",
+			"  if (typeof module === \"string\") {",
+			"    return { source: new ModuleSource(module, specifier) };",
+			"  }",
+			"",
+			"  if (module && typeof module === \"object\") {",
+			"    if (\"text\" in module) {",
+			"      return { source: createValueModule(module.text) };",
+			"    }",
+			"",
+			"    if (\"json\" in module) {",
+			"      return { source: createValueModule(module.json) };",
+			"    }",
+			"  }",
+			"",
+			"  throw new TypeError(`Guest module not found: ${specifier}`);",
+			"}",
+			"",
+			"function createGuestCompartment() {",
+			"  const SandboxHeaders = class SandboxHeaders extends Headers {};",
+			"  const SandboxRequest = class SandboxRequest extends Request {};",
+			"  const SandboxResponse = class SandboxResponse extends Response {};",
+			"  const SandboxURL = class SandboxURL extends URL {};",
+			"  const SandboxURLSearchParams = class SandboxURLSearchParams extends URLSearchParams {};",
+			"",
+			"  const compartment = new Compartment({",
+			"    globals: {",
+			"      console: createConsole(),",
+			"      Headers: SandboxHeaders,",
+			"      Request: SandboxRequest,",
+			"      Response: SandboxResponse,",
+			"      URL: SandboxURL,",
+			"      URLSearchParams: SandboxURLSearchParams,",
+			"    },",
+			"    resolveHook: (specifier: string, referrer: string) =>",
+			"      resolveGuestSpecifier(specifier, referrer),",
+			"    importHook: async (specifier: string) => loadGuestModule(specifier),",
+			"    __options__: true,",
+			"  });",
+			"",
+			"  Object.freeze(compartment.globalThis);",
+			"",
+			"  return { compartment, SandboxRequest, SandboxResponse };",
 			"}",
 			"",
 			"function getHandler(module: any) {",
@@ -110,14 +264,213 @@ function buildSandboxFiles(files: SandboxFiles, entryPoint: string): SandboxFile
 			"  return handler;",
 			"}",
 			"",
+			"function withSandboxHeaders(response: Response, requestNumber: number): Response {",
+			"  const headers = new Headers(response.headers);",
+			"  headers.set(\"x-sandbox-isolate-id\", getIsolateId());",
+			"  headers.set(\"x-sandbox-execution-id\", String(requestNumber));",
+			"  return new Response(response.body, {",
+			"    status: response.status,",
+			"    statusText: response.statusText,",
+			"    headers,",
+			"  });",
+			"}",
+			"",
 			"export default {",
 			"  async fetch(request: Request) {",
-			"    const guestModule = await getGuestModule();",
-			"    return getHandler(guestModule).fetch(request);",
+			"    const requestNumber = ++executionCount;",
+			"",
+			"    try {",
+			"      const { compartment, SandboxRequest, SandboxResponse } = createGuestCompartment();",
+			"      const guestModule = await compartment.import(GUEST_MAIN_MODULE);",
+			"      const response = await getHandler(guestModule).fetch(new SandboxRequest(request));",
+			"",
+			"      if (!(response instanceof SandboxResponse) && !(response instanceof Response)) {",
+			"        throw new TypeError(\"Guest fetch() must return a Response.\");",
+			"      }",
+			"",
+			"      return withSandboxHeaders(response, requestNumber);",
+			"    } catch (error) {",
+			"      const message = error instanceof Error ? error.message : String(error);",
+			"      return withSandboxHeaders(Response.json({ error: message }, { status: 500 }), requestNumber);",
+			"    }",
 			"  },",
 			"};",
 		].join("\n"),
 	};
+}
+
+function buildInlineBootstrapFiles(guestModuleSource: string): SandboxFiles {
+	return {
+		"package.json": JSON.stringify(
+			{
+				private: true,
+				dependencies: {
+					ses: SES_VERSION,
+				},
+			},
+			null,
+			2,
+		),
+		[BOOTSTRAP_PATH]: [
+			'import "ses";',
+			"",
+			"lockdown();",
+			"Object.freeze(globalThis);",
+			"",
+			"let isolateId: string | undefined;",
+			"let executionCount = 0;",
+			"",
+			guestModuleSource,
+			"",
+			"function getIsolateId(): string {",
+			"  isolateId ??= crypto.randomUUID();",
+			"  return isolateId;",
+			"}",
+			"",
+			"function createConsole() {",
+			"  return harden({",
+			"    log: (...args: unknown[]) => console.log(...args),",
+			"    info: (...args: unknown[]) => console.info(...args),",
+			"    warn: (...args: unknown[]) => console.warn(...args),",
+			"    error: (...args: unknown[]) => console.error(...args),",
+			"    debug: (...args: unknown[]) => console.debug(...args),",
+			"  });",
+			"}",
+			"",
+			"function createGuestCompartment() {",
+			"  const SandboxHeaders = class SandboxHeaders extends Headers {};",
+			"  const SandboxRequest = class SandboxRequest extends Request {};",
+			"  const SandboxResponse = class SandboxResponse extends Response {};",
+			"  const SandboxURL = class SandboxURL extends URL {};",
+			"  const SandboxURLSearchParams = class SandboxURLSearchParams extends URLSearchParams {};",
+			"",
+			"  const compartment = new Compartment({",
+			"    globals: {",
+			"      console: createConsole(),",
+			"      Headers: SandboxHeaders,",
+			"      Request: SandboxRequest,",
+			"      Response: SandboxResponse,",
+			"      URL: SandboxURL,",
+			"      URLSearchParams: SandboxURLSearchParams,",
+			"    },",
+			"    modules: {",
+			"      guest: { source: guestModuleSource },",
+			"    },",
+			"    __options__: true,",
+			"  });",
+			"",
+			"  Object.freeze(compartment.globalThis);",
+			"",
+			"  return { compartment, SandboxRequest, SandboxResponse };",
+			"}",
+			"",
+			"function describeValue(value: unknown): string {",
+			"  if (value === null) {",
+			"    return \"null\";",
+			"  }",
+			"",
+			"  if (value === undefined) {",
+			"    return \"undefined\";",
+			"  }",
+			"",
+			"  if (typeof value !== \"object\") {",
+			"    return typeof value;",
+			"  }",
+			"",
+			"  return `object keys=[${Object.keys(value).join(\", \")}]`;",
+			"}",
+			"",
+			"function getHandler(candidate: any) {",
+			"  let current = candidate;",
+			"",
+			"  for (let depth = 0; depth < 3; depth++) {",
+			"    if (current && typeof current.fetch === \"function\") {",
+			"      return current;",
+			"    }",
+			"",
+			"    if (!current || typeof current !== \"object\" || !(\"default\" in current)) {",
+			"      break;",
+			"    }",
+			"",
+			"    current = current.default;",
+			"  }",
+			"",
+			"  throw new TypeError(`Guest code must evaluate to a handler with a fetch() method. Received ${describeValue(candidate)}.`);",
+			"}",
+			"",
+			"function withSandboxHeaders(response: Response, requestNumber: number): Response {",
+			"  const headers = new Headers(response.headers);",
+			"  headers.set(\"x-sandbox-isolate-id\", getIsolateId());",
+			"  headers.set(\"x-sandbox-execution-id\", String(requestNumber));",
+			"  return new Response(response.body, {",
+			"    status: response.status,",
+			"    statusText: response.statusText,",
+			"    headers,",
+			"  });",
+			"}",
+			"",
+			"export default {",
+			"  async fetch(request: Request) {",
+			"    const requestNumber = ++executionCount;",
+			"",
+			"    try {",
+			"      const { compartment, SandboxRequest, SandboxResponse } = createGuestCompartment();",
+			"      const importResult = await compartment.import(\"guest\");",
+			"      const handler = getHandler(importResult.namespace);",
+			"      const response = await handler.fetch(new SandboxRequest(request));",
+			"",
+			"      if (!(response instanceof SandboxResponse) && !(response instanceof Response)) {",
+			"        throw new TypeError(\"Guest fetch() must return a Response.\");",
+			"      }",
+			"",
+			"      return withSandboxHeaders(response, requestNumber);",
+			"    } catch (error) {",
+			"      const message = error instanceof Error ? error.message : String(error);",
+			"      return withSandboxHeaders(Response.json({ error: message }, { status: 500 }), requestNumber);",
+			"    }",
+			"  },",
+			"};",
+		].join("\n"),
+	};
+}
+
+function buildInlineGuestModuleSource(moduleSource: string): string {
+	if (/\bimport\s*(?:[\{\w*]|\()/m.test(moduleSource)) {
+		throw new TypeError("/run currently supports a single-file worker without imports.");
+	}
+
+	const defaultExportMatches = moduleSource.match(/\bexport\s+default\b/g) ?? [];
+	if (defaultExportMatches.length !== 1) {
+		throw new TypeError("/run requires exactly one export default.");
+	}
+
+	if (/\bexport\s+(?!default\b)/m.test(moduleSource)) {
+		throw new TypeError("/run only supports default exports right now.");
+	}
+
+	const program = moduleSource.replace(
+		/\bexport\s+default\b/,
+		"const __sandboxDefaultExport =",
+	);
+
+	return [
+		"const guestModuleSource = {",
+		"  imports: [],",
+		'  exports: ["default"],',
+		"  execute(exportsTarget) {",
+		indentCode(program, 4),
+		"    exportsTarget.default = __sandboxDefaultExport;",
+		"  },",
+		"};",
+	].join("\n");
+}
+
+function indentCode(source: string, spaces: number): string {
+	const prefix = " ".repeat(spaces);
+	return source
+		.split("\n")
+		.map((line) => `${prefix}${line}`)
+		.join("\n");
 }
 
 function buildSandboxRequest(request: SandboxRequestInit | undefined): Request {
@@ -138,60 +491,6 @@ function isStringRecord(value: unknown): value is SandboxFiles {
 	}
 
 	return Object.values(value).every((entry) => typeof entry === "string");
-}
-
-function mergePackageJson(packageJsonSource: string | undefined): string {
-	const packageJson = packageJsonSource === undefined ? {} : JSON.parse(packageJsonSource);
-	const dependencies =
-		packageJson.dependencies && typeof packageJson.dependencies === "object"
-			? packageJson.dependencies
-			: {};
-
-	return JSON.stringify(
-		{
-			...packageJson,
-			dependencies: {
-				...dependencies,
-				ses: dependencies.ses ?? "^1.15.0",
-			},
-		},
-		null,
-		2,
-	);
-}
-
-function relativeModuleSpecifier(fromPath: string, toPath: string): string {
-	const fromParts = getDirectory(fromPath).split("/").filter(Boolean);
-	const toParts = toPath.split("/");
-	const toFile = toParts.pop();
-
-	if (!toFile) {
-		throw new TypeError(`Invalid module path: ${toPath}`);
-	}
-
-	let sharedParts = 0;
-	while (
-		sharedParts < fromParts.length &&
-		sharedParts < toParts.length &&
-		fromParts[sharedParts] === toParts[sharedParts]
-	) {
-		sharedParts++;
-	}
-
-	const upSegments = fromParts.length - sharedParts;
-	const downSegments = toParts.slice(sharedParts);
-	const relativeParts = [
-		...(upSegments === 0 ? ["."] : new Array(upSegments).fill("..")),
-		...downSegments,
-		toFile,
-	];
-
-	return relativeParts.join("/");
-}
-
-function getDirectory(filePath: string): string {
-	const lastSlash = filePath.lastIndexOf("/");
-	return lastSlash === -1 ? "" : filePath.slice(0, lastSlash);
 }
 
 function resolveEntryPoint(files: SandboxFiles, entryPoint: string | undefined): string {
@@ -231,15 +530,4 @@ function resolveEntryPoint(files: SandboxFiles, entryPoint: string | undefined):
 
 	throw new TypeError("Could not determine entry point. Provide entryPoint explicitly.");
 }
-
-function toOutputPath(filePath: string): string {
-	if (filePath.endsWith(".mts")) {
-		return `${filePath.slice(0, -4)}.mjs`;
-	}
-
-	if (filePath.endsWith(".ts") || filePath.endsWith(".tsx")) {
-		return `${filePath.replace(/\.tsx?$/, "")}.js`;
-	}
-
-	return filePath;
-}
+class SandboxPayloadError extends TypeError {}

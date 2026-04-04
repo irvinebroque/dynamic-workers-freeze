@@ -80,7 +80,7 @@ export function renderHomePage(
 <body>
   <main>
     <h1>Dynamic Worker Sandbox</h1>
-    <p>Paste untrusted Worker code, submit it to <code>/run</code>, and inspect the JSON response.</p>
+    <p><code>/run</code> makes three requests to one loaded dynamic worker and prints the isolate metadata for each response.</p>
     <form method="POST" action="/run">
       <textarea id="code" name="code">${escapedCode}</textarea>
       <button type="submit">Run</button>
@@ -93,8 +93,12 @@ export function renderHomePage(
 
 function getStarterCode(): string {
 	return [
+		"let moduleCounter = 0;",
+		"",
 		"export default {",
 		"  async fetch() {",
+		"    moduleCounter += 1;",
+		"",
 		"    let globalWrite = \"ok\";",
 		"    let protoWrite = \"ok\";",
 		"",
@@ -111,6 +115,7 @@ function getStarterCode(): string {
 		"    }",
 		"",
 		"    return Response.json({",
+		"      moduleCounter,",
 		"      globalWrite,",
 		"      protoWrite,",
 		"      globalFrozen: Object.isFrozen(globalThis),",
